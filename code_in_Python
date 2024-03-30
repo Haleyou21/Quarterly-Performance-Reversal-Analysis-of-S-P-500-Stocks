@@ -1,0 +1,323 @@
+```{r}
+library(quantmod)
+library(rvest)
+library(dplyr)
+library(PerformanceAnalytics)
+library(zoo)
+library(ggplot2)
+library(lmtest)
+```
+
+# Data Preparation
+
+## Get the Table of Tickers from Wikipedia
+Retrieve the list of S&P 500 companies.
+```{r}
+url <- "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+# Read HTML content from the page
+page <- read_html(url)
+
+# Extract the table containing the S&P 500 constituents
+table <- html_table(html_nodes(page, "table")[[1]])
+
+head(table)
+```
+## Filter Companies
+Exclude companies not present throughout the study period.
+```{r}
+table$`Date added` <- as.Date(table$`Date added`, format = "%Y-%m-%d")
+filtered_table <- table %>% 
+  filter(is.na(`Date added`) | `Date added` <= as.Date("2023-07-01"))
+
+spx_tickers <- filtered_table$Symbol
+spx_tickers <- gsub("\\.", "-", spx_tickers) #adjust format for yahoo
+```
+
+```{r}
+length(spx_tickers)
+```
+
+## Benchmark Performance
+Calculate the S&P 500 Total Return (SP500TR) for Q3 and Q4 for comparison.
+```{r}
+q3_start <- as.Date("2023-07-03")
+q3_end <- as.Date("2023-09-29")
+q4_start <- as.Date("2023-10-02")
+q4_end <- as.Date("2023-12-29")
+
+# Fetch S&P 500 TR data
+getSymbols("^SP500TR", from = "2023-01-01", to = "2023-12-31", auto.assign = TRUE)
+
+sp500tr_prices <- Ad(get("SP500TR"))
+sp500tr_q3_start <- as.numeric(first(sp500tr_prices[q3_start])) 
+sp500tr_q3_end <- as.numeric(last(sp500tr_prices[q3_end])) 
+sp500tr_q4_start <- as.numeric(first(sp500tr_prices[q4_start])) 
+sp500tr_q4_end <- as.numeric(last(sp500tr_prices[q4_end]))
+# Calculate benchmark total returns for Q3 and Q4
+sp500tr_q3_return <- (sp500tr_q3_end - sp500tr_q3_start) / sp500tr_q3_start 
+sp500tr_q4_return <- (sp500tr_q4_end - sp500tr_q4_start) / sp500tr_q4_start
+sp500tr_q3_return
+sp500tr_q4_return
+```
+
+## Calculate Quarterly Returns
+Calculate returns for Q3 and Q4 using adjusted close price with direct method.
+
+```{r}
+results_df <- data.frame(Ticker = character(), 
+                         Price_Adjust_Q3_Start = numeric(), Price_Adjust_Q3_End = numeric(), 
+                         Price_Adjust_Q4_Start = numeric(), Price_Adjust_Q4_End = numeric(), 
+                         Total_Return_Q3 = numeric(), Total_Return_Q4 = numeric(),
+                         Excess_Return_Q3 = numeric(), Excess_Return_Q4 = numeric(), stringsAsFactors = FALSE)
+
+process_ticker <- function(ticker) {
+  # Fetch adjusted prices
+  getSymbols(ticker, from = "2023-07-03", to = "2023-12-31", auto.assign = TRUE)
+  stock_prices <- Ad(get(ticker))
+  
+  # Calculate adjusted prices at the start and end of Q3 and Q4
+  price_adjust_q3_start <- as.numeric(first(stock_prices[q3_start]))
+  price_adjust_q3_end <- as.numeric(last(stock_prices[q3_end]))
+  price_adjust_q4_start <- as.numeric(first(stock_prices[q4_start]))
+  price_adjust_q4_end <- as.numeric(last(stock_prices[q4_end]))
+  
+  # Calculate total returns for Q3 and Q4
+  total_return_q3 <- (price_adjust_q3_end - price_adjust_q3_start) / price_adjust_q3_start
+  total_return_q4 <- (price_adjust_q4_end - price_adjust_q4_start) / price_adjust_q4_start
+  
+  # Calculate excess returns for Q3 and Q4
+  excess_return_q3 <- total_return_q3 - sp500tr_q3_return
+  excess_return_q4 <- total_return_q4 - sp500tr_q4_return
+  
+  data.frame(Ticker = ticker, 
+             Price_Adjust_Q3_Start = price_adjust_q3_start, Price_Adjust_Q3_End = price_adjust_q3_end, 
+             Price_Adjust_Q4_Start = price_adjust_q4_start, Price_Adjust_Q4_End = price_adjust_q4_end, 
+             Total_Return_Q3 = total_return_q3, Total_Return_Q4 = total_return_q4,
+             Excess_Return_Q3 = excess_return_q3, Excess_Return_Q4 = excess_return_q4, stringsAsFactors = FALSE)
+}
+for (ticker in spx_tickers) {
+  results_df <- rbind(results_df, process_ticker(ticker))
+}
+
+
+head(results_df)
+```
+
+
+
+## Identify Outperform & Underperform Groups
+Classify stocks based on their performance relative to the S&P 500 TR.
+```{r}
+outperform_q3 <- results_df$Ticker[results_df$Total_Return_Q3 > as.numeric(sp500tr_q3_return)]
+underperform_q3 <- results_df$Ticker[results_df$Total_Return_Q3 <= as.numeric(sp500tr_q3_return)]
+outperform_q4 <- results_df$Ticker[results_df$Total_Return_Q4 > as.numeric(sp500tr_q4_return)]
+underperform_q4 <- results_df$Ticker[results_df$Total_Return_Q4 <= as.numeric(sp500tr_q4_return)]
+```
+
+
+
+# Explorative Analysis
+
+## Performance Reversal Table
+Create a table to explore performance reversal and consistency.
+```{r}
+# Intersection for reversal and consistency
+outperform_q3_underperform_q4 <- intersect(outperform_q3, underperform_q4)
+underperform_q3_outperform_q4 <- intersect(underperform_q3, outperform_q4)
+
+# 2x2 Table setup
+performance_table <- matrix(nrow = 2, ncol = 2,
+                            dimnames = list(c("Outperform Q3", "Underperform Q3"),
+                                            c("Underperform Q4", "Outperform Q4")))
+
+# Fill the table
+performance_table["Outperform Q3", "Underperform Q4"] <- length(outperform_q3_underperform_q4)
+performance_table["Underperform Q3", "Outperform Q4"] <- length(underperform_q3_outperform_q4)
+
+# For completeness, if you want to track consistent performers as well
+consistent_outperformers <- length(intersect(outperform_q3, outperform_q4))
+consistent_underperformers <- length(intersect(underperform_q3, underperform_q4))
+
+performance_table["Outperform Q3", "Outperform Q4"] <- consistent_outperformers
+performance_table["Underperform Q3", "Underperform Q4"] <- consistent_underperformers
+
+print(performance_table)
+
+```
+The diagonal from top right to bottom left shows the number of stocks that maintained their performance status across quarters, while the off-diagonal elements show the number of stocks that reversed their performance.
+
+## Visualization of Performance
+
+Visualize stock performance relative to the S&P 500 TR for Q3 and Q4 to illustrate outperformance and underperformance.
+
+```{r}
+results_df <- results_df %>%
+  mutate(
+    Performance_Q3 = ifelse(Total_Return_Q3 > sp500tr_q3_return, "Outperform", "Underperform"),
+    Performance_Q4 = ifelse(Total_Return_Q4 > sp500tr_q4_return, "Outperform", "Underperform"),
+    # Identify target groups: underperformers in Q3 who are outperformers in Q4, and vice versa
+    Target_Group = case_when(
+      Performance_Q3 == "Underperform" & Performance_Q4 == "Outperform" ~ "Underperform Q3, Outperform Q4",
+      Performance_Q3 == "Outperform" & Performance_Q4 == "Underperform" ~ "Outperform Q3, Underperform Q4",
+      TRUE ~ "Other"
+    ),
+    # Assign colors based on the target group
+    Performance_Color = case_when(
+      Target_Group == "Underperform Q3, Outperform Q4" ~ "dodgerblue3",
+      Target_Group == "Outperform Q3, Underperform Q4" ~ "darkorange",
+      TRUE ~ "grey50" # Other cases colored grey for neutrality
+    )
+  )
+
+# Use the updated Performance_Color for plotting
+ggplot(results_df, aes(x = Total_Return_Q3, y = Total_Return_Q4, color = Performance_Color)) +
+  geom_point(alpha = 0.5) +
+  geom_vline(xintercept = sp500tr_q3_return, linetype = "dashed", color = "black", size = 1) + 
+  geom_hline(yintercept = sp500tr_q4_return, linetype = "dashed", color = "black", size = 1) +
+  scale_color_identity() +
+  labs(title = "Stock Performance vs. SP500TR in Q3 and Q4",
+       x = "Q3 Total Return",
+       y = "Q4 Total Return",
+       caption = "Blue: Underperform Q3, Outperform Q4; Orange: Outperform Q3, Underperform Q4; Grey: Others") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+# Regression Analysis
+
+Conduct regression analysis to explore the relationship between Q3 and Q4 returns for outperforming and underperforming stocks.
+
+```{r}
+# Subset for stocks that outperformed in Q3
+outperform_q3_df <- results_df %>%
+  filter(Ticker %in% outperform_q3)
+
+# Subset for stocks that underperformed in Q3
+underperform_q3_df <- results_df %>%
+  filter(Ticker %in% underperform_q3)
+
+# Run the regression model
+model_outperform <- lm(Total_Return_Q4  ~ Total_Return_Q3, data = outperform_q3_df)
+summary(model_outperform)
+```
+For the outperforming group, the regression model is:
+
+${Total\_Return\_Q4_i} = 0.13102 - 0.41075 \times {Total\_Return\_Q3_i} + \epsilon _i$
+
+- **Slope**: The negative coefficient for `Total_Return_Q3` (-0.41075) suggests a negative relationship between Q3 and Q4 returns for outperformers. For every percentage point increase in Q3 return, there is an expected decrease in Q4 return by roughly 0.41 percentage points.
+- **p-value**: The p-value for `Total_Return_Q3` is very small (0.00032), indicating that the negative relationship is statistically significant.
+- **R-squared**: This value indicates that around 6.57% of the variability in Q4 returns for outperforming stocks can be explained by their Q3 returns. This is a relatively low R-squared value, suggesting that other factors not included in the model also play a significant role in determining Q4 returns.
+
+```{r}
+model_underperform <- lm(Total_Return_Q4 ~ Total_Return_Q3, data = underperform_q3_df)
+summary(model_underperform)
+```
+For the underperforming group, the regression model is:
+
+${Total\_Return\_Q4_i} = 0.13479 - 0.12431 \times {Total\_Return\_Q3_i}+ \epsilon _i$
+
+- **Slope**: The negative coefficient for `Total_Return_Q3` (-0.12431) implies that there might be a slight negative relationship between Q3 and Q4 returns.
+- **p-value**: The p-value is relatively large (0.22), indicating that the inverse relationship is NOT statistically significant.
+- **R-squared**: An even lower R-squared value for underperformers indicates that Q3 returns have almost no explanatory power for Q4 returns, with only about 0.5% of the variability in Q4 returns being explained by Q3 returns.
+
+
+
+## Check Assumption
+
+### Outperformaners
+```{r}
+# Plot to check linearity
+ggplot(outperform_q3_df, aes(x = Total_Return_Q3, y = Total_Return_Q4)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(title = "Q3 vs Q4 Total Returns for Outperformers",
+       x = "Q3 Total Return",
+       y = "Q4 Total Return") +
+  theme_minimal()
+
+# Plot of residuals vs fitted values to check for homoscedasticity
+plot(fitted(model_outperform), residuals(model_outperform),
+     xlab = "Fitted Values", ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+abline(h = 0, col = "red", lwd = 2)
+
+# Check for normality of residuals with a Q-Q plot
+qqnorm(residuals(model_outperform))
+qqline(residuals(model_outperform))
+
+# Perform Durbin-Watson test to check independence of residuals
+dwtest(model_outperform)
+```
+After reviewing the linear regression assumptions through various diagnostic tests, including the Durbin-Watson test for independence, Q-Q plots for normality, and residual plots for homoscedasticity, our findings suggest no significant violations of these assumptions. The results affirm that our linear regression model for Q3 outperformers is reliable.
+
+
+### Underperformers
+```{r}
+# Plot to check linearity
+ggplot(underperform_q3_df, aes(x = Total_Return_Q3, y = Total_Return_Q4)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(title = "Q3 vs Q4 Total Returns for Underperformers",
+       x = "Q3 Total Return",
+       y = "Q4 Total Return") +
+  theme_minimal()
+
+# Plot of residuals vs fitted values to check for homoscedasticity
+plot(fitted(model_underperform), residuals(model_underperform),
+     xlab = "Fitted Values", ylab = "Residuals",
+     main = "Residuals vs Fitted Values")
+abline(h = 0, col = "red", lwd = 2)
+
+# Check for normality of residuals with a Q-Q plot
+qqnorm(residuals(model_underperform))
+qqline(residuals(model_underperform))
+
+
+# Perform Durbin-Watson test to check independence of residuals
+dwtest(model_underperform)
+
+
+
+```
+Upon examination, there appears to be a deviation from the assumptions of linearity and homoscedasticity for Q3 underperformers.
+
+
+# Discussion
+
+## Limitations:
+
+- **Limited Data Scope**: The analysis is primarily based on price-adjusted returns and compares these against the S&P 500 Total Return index. It does not consider other potentially influential factors such as volume changes, market sentiment, or macroeconomic indicators.
+
+- **Assumption of Linearity**: The use of linear regression models assumes a linear relationship between Q3 and Q4 performances. This simplification may miss more complex, non-linear dynamics in stock performance.
+
+- **Exclusion of External Factors**: The study does not account for external events or shocks (e.g., geopolitical events, significant policy changes, or unexpected economic data releases) that could significantly impact stock performances independently of past trends.
+
+
+## Future Research Plans:
+
+- **Incorporate Additional Variables**: Future models could benefit from including financial health indicators (like P/E ratios or debt levels), trading volume data, sector-specific performance, and macroeconomic indicators to capture a broader range of influences.
+
+- **Explore Non-Linear Models**: Considering non-linear statistical models could uncover more complex relationships between quarterly performances that linear regression might miss.
+
+- **Examine the Impact of External Shocks**: For a more comprehensive understanding, future studies might integrate global economic indicators, political risk assessments, and market trend analyses.
+
+
+## Reason Behind Performance Trends
+
+
+- **Market Shifts and Sector Impact**: Key events occurring between Q3 and Q4 may have significantly swayed market sentiment and sector performance. While outperformers were likely more susceptible to these shifts, leading to a noticeable reversal, underperformers may have been less affected due to more stable valuations or being in sectors that were less impacted by these events.
+
+- **Stable Valuation and Inherent Characteristics**: Underperformers might not have shown a similar trend due to already being valued more in line with their fundamentals. Additionally, characteristics intrinsic to these stocks, such as lower volatility or a different investor composition, could contribute to their steadier performance, mitigating the potential for dramatic reversals.
+
+
+
+# Conclusion
+
+- For outperformers in Q3, there appears to be a mild reversal in performance in Q4, where stocks that did well in Q3 tend to not perform as well in Q4.
+- For underperformers in Q3, there is no significant evidence to suggest that their performance in Q4 is related to how they performed in Q3.
+
+
+- **These findings suggest that the hypothesis of a reversal in performance from Q3 to Q4 may hold some weight for the outperformers but is not substantiated for underperformers.**
